@@ -17,7 +17,17 @@ COPY app ./app
 COPY alembic ./alembic
 COPY alembic.ini .
 COPY entrypoint.sh .
-RUN chmod +x entrypoint.sh
+RUN chmod +x entrypoint.sh \
+    && groupadd --gid 1000 resonar \
+    && useradd --uid 1000 --gid 1000 --no-create-home --home-dir /tmp resonar
+
+# UID 1000 matches the host owner of the ./data, ./media and ./config bind
+# mounts. Temp files (yt-dlp downloads, batch zips in progress) go to
+# /data/tmp on disk rather than a RAM tmpfs: a 100-track batch is ~0.5 GB.
+ENV HOME=/tmp \
+    XDG_CACHE_HOME=/tmp/.cache \
+    TMPDIR=/data/tmp
+USER resonar
 
 EXPOSE 8000
 
