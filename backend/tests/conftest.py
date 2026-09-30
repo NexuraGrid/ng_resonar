@@ -28,6 +28,7 @@ import pytest
 
 _BACKEND_DIR = os.path.dirname(os.path.dirname(__file__))
 _TABLES = (
+    "saved_videos",
     "user_settings",
     "history",
     "favorites",

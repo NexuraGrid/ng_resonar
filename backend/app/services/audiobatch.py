@@ -1,4 +1,8 @@
-"""Background job: download N tracks as MP3/etc and zip them up."""
+"""Background job: download N tracks as MP3/etc and zip them up.
+
+Job state lives in Redis (``jobs.JobStore``); the zip lands in
+``{data_dir}/batches/<job_id>.zip`` and is swept after a day.
+"""
 
 from __future__ import annotations
 
@@ -15,13 +19,13 @@ from fastapi.concurrency import run_in_threadpool
 
 from ..config import settings
 from . import ytdlp
+from .jobs import UNFINISHED, JobStore
 
 BATCH_DIR = os.path.join(settings.data_dir, "batches")
-
-_jobs: dict[str, dict] = {}
+store = JobStore("batch")
+# One batch runs at a time per process: each is up to 100 yt-dlp + ffmpeg runs.
 _sem = asyncio.Semaphore(1)
-# Unfinished (queued or running) batch jobs one user may have at once. Each job
-# is up to 100 tracks of yt-dlp + ffmpeg work and a zip on disk.
+# Unfinished (queued or running) batch jobs one user may have at once.
 MAX_ACTIVE_PER_USER = 2
 _JOB_ID_RE = re.compile(r"^b_[0-9a-f]{32}$")
 
@@ -46,10 +50,12 @@ def cleanup_old(max_age: int = 86_400) -> None:
             pass
 
 
-def status(job_id: str, owner: int | None = None) -> dict | None:
-    """The job, or ``None`` if unknown or (when ``owner`` is given) not theirs."""
-    job = _jobs.get(job_id)
-    if job is None or (owner is not None and job.get("owner") != owner):
+async def status(job_id: str, owner: int) -> dict | None:
+    """The job, or ``None`` if unknown or not ``owner``'s."""
+    if not _JOB_ID_RE.match(job_id):
+        return None
+    job = await store.get(job_id)
+    if job is None or job.get("owner") != owner:
         return None
     return job
 
@@ -61,38 +67,46 @@ def zip_path(job_id: str) -> str | None:
     return path if os.path.exists(path) else None
 
 
-def _run_sync(job_id: str, ids: list[str], fmt: str) -> None:
-    job = _jobs[job_id]
+def _run_sync(job_id: str, ids: list[str], fmt: str) -> int:
+    """Download + zip on a worker thread. Returns the number of tracks zipped."""
     workdir = tempfile.mkdtemp(prefix="resonar-batch-")
     files: list[str] = []
     try:
         for i, vid in enumerate(ids):
-            job["progress"] = {"done": i, "total": len(ids)}
+            store.update_from_thread(job_id, progress={"done": i, "total": len(ids)})
             try:
-                path, tmpd = ytdlp._download_sync(vid, fmt)
+                path, tmpd = ytdlp.download_audio_sync(vid, fmt)
                 dest = os.path.join(workdir, os.path.basename(path))
                 shutil.move(path, dest)
                 shutil.rmtree(tmpd, ignore_errors=True)
                 files.append(dest)
             except Exception:  # noqa: BLE001 - skip the ones that fail
                 continue
-        job["progress"] = {"done": len(ids), "total": len(ids)}
-
+        store.update_from_thread(
+            job_id, progress={"done": len(ids), "total": len(ids)}
+        )
         if not files:
             raise RuntimeError("no se pudo descargar ninguna pista")
-
         ensure_dir()
         zpath = os.path.join(BATCH_DIR, f"{job_id}.zip")
         with zipfile.ZipFile(zpath, "w", zipfile.ZIP_STORED) as zf:
             for fp in files:
                 zf.write(fp, arcname=os.path.basename(fp))
-        job["status"] = "ready"
-        job["count"] = len(files)
-    except Exception as exc:  # noqa: BLE001
-        job["status"] = "error"
-        job["error"] = str(exc)
+        return len(files)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+async def _run(job_id: str, ids: list[str], fmt: str) -> None:
+    async with store.running(job_id):
+        async with _sem:
+            await store.update(job_id, status="downloading")
+            try:
+                count = await run_in_threadpool(_run_sync, job_id, ids, fmt)
+            except Exception as exc:  # noqa: BLE001
+                await store.update(job_id, status="error", error=str(exc))
+            else:
+                await store.update(job_id, status="ready", count=count)
 
 
 async def start(
@@ -100,23 +114,19 @@ async def start(
 ) -> str:
     active = sum(
         1
-        for j in _jobs.values()
-        if j.get("owner") == owner and j["status"] == "downloading"
+        for job in (await store.all()).values()
+        if job.get("owner") == owner and job.get("status") in UNFINISHED
     )
     if active >= MAX_ACTIVE_PER_USER:
         raise TooManyJobs()
     job_id = "b_" + uuid.uuid4().hex
-    _jobs[job_id] = {
-        "owner": owner,
-        "status": "downloading",
-        "progress": {"done": 0, "total": len(ids)},
-        "error": None,
-        "filename": f"{(name or 'playlist').strip() or 'playlist'}.zip",
-    }
-
-    async def _run() -> None:
-        async with _sem:
-            await run_in_threadpool(_run_sync, job_id, ids, fmt)
-
-    asyncio.create_task(_run())
+    await store.create(
+        job_id,
+        owner=owner,
+        status="queued",
+        progress={"done": 0, "total": len(ids)},
+        error=None,
+        filename=f"{(name or 'playlist').strip() or 'playlist'}.zip",
+    )
+    asyncio.create_task(_run(job_id, ids, fmt))
     return job_id

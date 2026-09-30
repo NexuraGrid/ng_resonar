@@ -29,7 +29,7 @@ async def download(
             detail=f"format must be one of {sorted(ytdlp.DOWNLOAD_FORMATS)}",
         )
     try:
-        path, tmpdir = await ytdlp.download(video_id, fmt)
+        path, tmpdir = await ytdlp.download_audio(video_id, fmt)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"download failed: {exc}") from exc
 
@@ -73,11 +73,12 @@ async def download_batch(
 async def download_batch_status(
     job_id: str, user: User = Depends(current_user)
 ):
-    st = audiobatch.status(job_id, owner=user.id)
+    st = await audiobatch.status(job_id, owner=user.id)
     if not st:
         raise HTTPException(status_code=404, detail="job not found")
     return {
-        "status": st["status"],
+        # The client only knows downloading / ready / error.
+        "status": "downloading" if st["status"] == "queued" else st["status"],
         "progress": st.get("progress"),
         "error": st.get("error"),
         "ready": st["status"] == "ready" and audiobatch.zip_path(job_id) is not None,
@@ -88,7 +89,7 @@ async def download_batch_status(
 async def download_batch_file(
     job_id: str, user: User = Depends(current_user)
 ):
-    st = audiobatch.status(job_id, owner=user.id)
+    st = await audiobatch.status(job_id, owner=user.id)
     path = audiobatch.zip_path(job_id) if st else None
     if not st or not path:
         raise HTTPException(status_code=404, detail="not ready")

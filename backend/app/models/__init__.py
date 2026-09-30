@@ -6,6 +6,7 @@ from .playlist import Playlist, PlaylistTrack
 from .favorite import Favorite
 from .history import History
 from .user_settings import UserSettings
+from .saved_video import SavedVideo
 
 __all__ = [
     "Base",
@@ -15,4 +16,5 @@ __all__ = [
     "Favorite",
     "History",
     "UserSettings",
+    "SavedVideo",
 ]
