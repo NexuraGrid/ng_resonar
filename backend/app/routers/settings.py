@@ -1,4 +1,6 @@
+import html
 import time
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
@@ -70,8 +72,9 @@ async def lastfm_auth_url(
             status_code=400, detail="guarda primero la API key de Last.fm"
         )
     url = (
-        f"https://www.last.fm/api/auth/?api_key={cfg['lastfm']['apiKey']}"
-        f"&cb={callback}"
+        "https://www.last.fm/api/auth/"
+        f"?api_key={quote(cfg['lastfm']['apiKey'], safe='')}"
+        f"&cb={quote(callback, safe='')}"
     )
     return {"url": url}
 
@@ -99,6 +102,7 @@ async def lastfm_callback(
         )
     except Exception as exc:  # noqa: BLE001
         msg = f"No se pudo conectar con Last.fm: {exc}"
+    msg = html.escape(msg)
     return HTMLResponse(
         f"<!doctype html><meta charset=utf-8>"
         f"<body style='font-family:system-ui;background:#0E1414;color:#E6EDEB;"

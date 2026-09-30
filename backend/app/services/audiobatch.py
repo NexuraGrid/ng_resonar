@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -19,6 +20,14 @@ BATCH_DIR = os.path.join(settings.data_dir, "batches")
 
 _jobs: dict[str, dict] = {}
 _sem = asyncio.Semaphore(1)
+# Unfinished (queued or running) batch jobs one user may have at once. Each job
+# is up to 100 tracks of yt-dlp + ffmpeg work and a zip on disk.
+MAX_ACTIVE_PER_USER = 2
+_JOB_ID_RE = re.compile(r"^b_[0-9a-f]{32}$")
+
+
+class TooManyJobs(Exception):
+    """The user already has ``MAX_ACTIVE_PER_USER`` unfinished jobs."""
 
 
 def ensure_dir() -> None:
@@ -37,11 +46,17 @@ def cleanup_old(max_age: int = 86_400) -> None:
             pass
 
 
-def status(job_id: str) -> dict | None:
-    return _jobs.get(job_id)
+def status(job_id: str, owner: int | None = None) -> dict | None:
+    """The job, or ``None`` if unknown or (when ``owner`` is given) not theirs."""
+    job = _jobs.get(job_id)
+    if job is None or (owner is not None and job.get("owner") != owner):
+        return None
+    return job
 
 
 def zip_path(job_id: str) -> str | None:
+    if not _JOB_ID_RE.match(job_id):
+        return None
     path = os.path.join(BATCH_DIR, f"{job_id}.zip")
     return path if os.path.exists(path) else None
 
@@ -80,9 +95,19 @@ def _run_sync(job_id: str, ids: list[str], fmt: str) -> None:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-async def start(ids: list[str], fmt: str, name: str | None) -> str:
-    job_id = "b_" + uuid.uuid4().hex[:12]
+async def start(
+    ids: list[str], fmt: str, name: str | None, *, owner: int
+) -> str:
+    active = sum(
+        1
+        for j in _jobs.values()
+        if j.get("owner") == owner and j["status"] == "downloading"
+    )
+    if active >= MAX_ACTIVE_PER_USER:
+        raise TooManyJobs()
+    job_id = "b_" + uuid.uuid4().hex
     _jobs[job_id] = {
+        "owner": owner,
         "status": "downloading",
         "progress": {"done": 0, "total": len(ids)},
         "error": None,

@@ -12,6 +12,42 @@ from . import ytmusic
 from .ytdlp import _base_opts
 
 
+# Only YouTube hosts are ever handed to yt-dlp. Its generic extractor will
+# otherwise fetch any URL a user pastes, turning the importer into a request
+# forwarder into the Docker network and the LAN (db, redis, the router...).
+_ALLOWED_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+}
+
+
+class UnsupportedUrl(ValueError):
+    """Raised for anything that is not an http(s) YouTube / YT Music URL."""
+
+
+def check_url(url: str) -> str:
+    """Return ``url`` stripped, or raise ``UnsupportedUrl``."""
+    url = (url or "").strip()
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except ValueError as exc:
+        raise UnsupportedUrl("URL inválida") from exc
+    if (
+        parsed.scheme not in ("http", "https")
+        or host not in _ALLOWED_HOSTS
+        or port not in (None, 80, 443)
+        or parsed.username
+        or parsed.password
+    ):
+        raise UnsupportedUrl("Solo se pueden importar URLs de YouTube o YouTube Music.")
+    return url
+
+
 def _extract_list_id(url: str) -> str | None:
     query = parse_qs(urlparse(url).query)
     if query.get("list"):
@@ -103,6 +139,7 @@ def _ytdlp_playlist_sync(url: str, limit: int) -> dict:
 
 
 async def import_url(url: str, limit: int = 300) -> dict:
+    url = check_url(url)
     list_id = _extract_list_id(url)
     seed = _extract_video_id(url)
     is_mix = bool(list_id and list_id.startswith("RD"))

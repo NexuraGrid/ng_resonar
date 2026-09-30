@@ -130,7 +130,26 @@ def _on_progress(video_id: str, d: dict) -> None:
         job["progress"] = "uniendo audio y video…"
 
 
-def _download_sync(video_id: str, quality: int) -> dict:
+def can_manage(video_id: str, user_id: int, is_admin: bool) -> bool:
+    """Whether a user may delete / re-download a saved video.
+
+    The library is shared (everyone sees every saved video), but only whoever
+    saved it or a superadmin may remove it. Videos saved before ``savedBy`` was
+    recorded are admin-only.
+    """
+    if is_admin:
+        return True
+    job = _jobs.get(video_id)
+    if job and job.get("savedBy") is not None:
+        return job["savedBy"] == user_id
+    meta = meta_for(video_id)
+    if meta is None:
+        # Nothing saved and no job: there is nothing of anyone else's to touch.
+        return job is None
+    return meta.get("savedBy") == user_id
+
+
+def _download_sync(video_id: str, quality: int, saved_by: int | None = None) -> dict:
     mp4, meta_path = _paths(video_id)
     opts = {
         **_base_opts(),
@@ -166,13 +185,16 @@ def _download_sync(video_id: str, quality: int) -> dict:
         "quality": quality,
         "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
         "savedAt": int(time.time()),
+        "savedBy": saved_by,
     }
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f)
     return meta
 
 
-async def start_save(video_id: str, quality: int, *, force: bool = False) -> str:
+async def start_save(
+    video_id: str, quality: int, *, force: bool = False, saved_by: int | None = None
+) -> str:
     if force:
         delete_saved(video_id)
 
@@ -188,13 +210,17 @@ async def start_save(video_id: str, quality: int, *, force: bool = False) -> str
         "progress": "en cola…",
         "title": None,
         "error": None,
+        "savedBy": saved_by,
     }
 
     async def _run() -> None:
         async with _sem:
             try:
-                meta = await run_in_threadpool(_download_sync, video_id, quality)
+                meta = await run_in_threadpool(
+                    _download_sync, video_id, quality, saved_by
+                )
                 _jobs[video_id] = {
+                    "savedBy": saved_by,
                     "status": "ready",
                     "progress": None,
                     "title": meta.get("title"),
@@ -203,6 +229,7 @@ async def start_save(video_id: str, quality: int, *, force: bool = False) -> str
             except Exception as exc:  # noqa: BLE001
                 _purge(video_id)
                 _jobs[video_id] = {
+                    "savedBy": saved_by,
                     "status": "error",
                     "progress": None,
                     "title": None,

@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ..db import get_db
@@ -12,8 +12,8 @@ router = APIRouter(tags=["playlists"])
 
 
 class CreateBody(BaseModel):
-    name: str = ""
-    fromUrl: str | None = None
+    name: str = Field("", max_length=200)
+    fromUrl: str | None = Field(None, max_length=2048)
 
 
 class RenameBody(BaseModel):
@@ -46,7 +46,10 @@ async def create(
     tracks = None
     name = body.name
     if body.fromUrl:
-        res = await importer.import_url(body.fromUrl)
+        try:
+            res = await importer.import_url(body.fromUrl)
+        except importer.UnsupportedUrl as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         tracks = res.get("tracks") or []
         if not name.strip():
             name = res.get("title") or "Playlist importada"
