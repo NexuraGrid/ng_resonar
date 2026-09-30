@@ -1,6 +1,11 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 
-import { createPlaylist, deletePlaylist, usePlaylists } from "../state/playlists";
+import {
+  createPlaylist,
+  deletePlaylist,
+  importPlaylistFile,
+  usePlaylists,
+} from "../state/playlists";
 import Icon from "./Icon";
 
 export default function PlaylistsView({
@@ -11,6 +16,7 @@ export default function PlaylistsView({
   const lists = usePlaylists();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const fileRef = useRef<HTMLInputElement>(null);
 
   async function newEmpty() {
     const name = window.prompt("Nombre de la playlist");
@@ -44,6 +50,34 @@ export default function PlaylistsView({
     }
   }
 
+  // A `.resonar.json` someone exported from their playlist: becomes a copy
+  // of that playlist in this account.
+  async function importFile(file: File) {
+    setError("");
+    if (file.size > 900_000) {
+      setError("El archivo es demasiado grande.");
+      return;
+    }
+    let data: unknown;
+    try {
+      data = JSON.parse(await file.text());
+    } catch {
+      setError("Ese archivo no es una playlist exportada de Resonar.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const pl = await importPlaylistFile(data);
+      onOpen(pl.id);
+    } catch (e) {
+      const raw = e instanceof Error ? e.message : "";
+      const detail = raw.replace(/^\d{3}\s*/, "").trim();
+      setError(detail || "No se pudo importar ese archivo.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="view">
       <div className="view__bar">
@@ -56,6 +90,26 @@ export default function PlaylistsView({
             {busy ? <span className="spinner" /> : <Icon name="list" size={15} />}{" "}
             Importar de URL
           </button>
+          <button
+            className="btn"
+            onClick={() => fileRef.current?.click()}
+            disabled={busy}
+            title="Importar una playlist que alguien te compartió (.resonar.json)"
+          >
+            <Icon name="upload" size={15} /> Importar archivo
+          </button>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".json,application/json"
+            hidden
+            data-testid="playlist-file"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              e.target.value = "";
+              if (file) void importFile(file);
+            }}
+          />
         </div>
       </div>
 
@@ -65,7 +119,8 @@ export default function PlaylistsView({
         <div className="empty">
           <p>Aún no tienes playlists.</p>
           <p className="empty__sub">
-            Crea una, o importa desde una URL de YouTube / YT Music.
+            Crea una, importa desde una URL de YouTube / YT Music, o importa
+            el archivo de una playlist que alguien te compartió.
           </p>
         </div>
       ) : (

@@ -23,6 +23,13 @@ const PATHS: Record<string, ReactElement> = {
       <path d="M5 21h14" />
     </>
   ),
+  upload: (
+    <>
+      <path d="M12 16V4" />
+      <path d="m7 9 5-5 5 5" />
+      <path d="M5 21h14" />
+    </>
+  ),
   play: <path d="M8 5v14l11-7z" />,
   pause: (
     <>

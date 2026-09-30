@@ -3,6 +3,7 @@ import { useEffect, useMemo, useSyncExternalStore } from "react";
 import {
   addTracksApi,
   createPlaylistApi,
+  importPlaylistFileApi,
   deletePlaylistApi,
   getPlaylist,
   listPlaylists,
@@ -110,6 +111,14 @@ export function usePlaylist(id: string | null): Playlist | undefined {
 
 export async function createPlaylist(name: string, fromUrl?: string) {
   const pl = await createPlaylistApi(name, fromUrl);
+  details = { ...details, [pl.id]: pl };
+  await refreshList();
+  return pl;
+}
+
+/** Import a playlist someone exported (the parsed ``.resonar.json``). */
+export async function importPlaylistFile(file: unknown) {
+  const pl = await importPlaylistFileApi(file);
   details = { ...details, [pl.id]: pl };
   await refreshList();
   return pl;

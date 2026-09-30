@@ -1,4 +1,7 @@
+from urllib.parse import quote
+
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -6,7 +9,7 @@ from sqlalchemy.orm import Session
 from ..db import get_db
 from ..deps import current_user
 from ..models import User
-from ..services import importer, playlists
+from ..services import importer, playlist_share, playlists
 
 router = APIRouter(tags=["playlists"])
 
@@ -64,6 +67,41 @@ async def create(
             )
     return await run_in_threadpool(
         playlists.create, db, user.id, name, tracks
+    )
+
+
+@router.post("/playlists/import")
+async def import_file(
+    body: dict,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    """Create a copy of an exported playlist in the caller's account."""
+    try:
+        name, tracks = playlist_share.parse_import(body)
+    except playlist_share.InvalidPlaylistFile as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return await run_in_threadpool(playlists.create, db, user.id, name, tracks)
+
+
+@router.get("/playlists/{pid}/export")
+async def export_file(
+    pid: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    pl = await run_in_threadpool(playlists.get, db, user.id, pid)
+    if not pl:
+        raise HTTPException(status_code=404, detail="playlist not found")
+    filename = playlist_share.filename_for(pl["name"])
+    return JSONResponse(
+        playlist_share.export_payload(pl),
+        headers={
+            "Content-Disposition": (
+                "attachment; filename=\"playlist.resonar.json\"; "
+                f"filename*=UTF-8''{quote(filename)}"
+            )
+        },
     )
 
 

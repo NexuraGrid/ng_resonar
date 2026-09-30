@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-import { batchFileUrl, batchStatusApi, startBatchApi } from "../api";
+import { batchFileUrl, batchStatusApi, playlistExportUrl, startBatchApi } from "../api";
 import {
   deletePlaylist,
   removeFromPlaylist,
@@ -143,6 +143,14 @@ export default function PlaylistDetailView({
             >
               <Icon name="offline" size={14} /> Sin conexión
             </button>
+            <a
+              className="btn"
+              href={playlistExportUrl(id)}
+              download
+              title="Descarga un archivo para compartir esta playlist: quien lo importe tendrá su propia copia"
+            >
+              <Icon name="upload" size={14} /> Compartir (exportar)
+            </a>
             <button
               className="btn"
               onClick={() => {
