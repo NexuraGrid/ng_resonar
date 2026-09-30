@@ -212,6 +212,13 @@ export const getPlaylist = (id: string) => getJSON<Playlist>(`/playlists/${id}`)
 export const createPlaylistApi = (name: string, fromUrl?: string) =>
   send<Playlist>(`/playlists`, "POST", { name, fromUrl });
 
+/** Download URL for a playlist's share file (``<name>.resonar.json``). */
+export const playlistExportUrl = (id: string) => `${BASE}/playlists/${id}/export`;
+
+/** Create a copy of an exported playlist file in the current account. */
+export const importPlaylistFileApi = (file: unknown) =>
+  send<Playlist>(`/playlists/import`, "POST", file);
+
 export const renamePlaylistApi = (id: string, name: string) =>
   send<Playlist>(`/playlists/${id}`, "PATCH", { name });
 
