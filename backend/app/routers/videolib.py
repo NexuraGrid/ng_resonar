@@ -1,10 +1,23 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 
+from ..deps import current_user
+from ..models import User
+from ..models.user import ROLE_SUPERADMIN
 from ..services import videolib
 from ._shared import VideoId
 
 router = APIRouter(tags=["videolib"])
+
+
+def _require_manage(video_id: str, user: User) -> None:
+    if not videolib.can_manage(
+        video_id, user.id, user.role == ROLE_SUPERADMIN
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Solo quien guardó este video (o un admin) puede quitarlo.",
+        )
 
 
 @router.get("/library/videos")
@@ -17,13 +30,19 @@ async def save_video(
     video_id: VideoId,
     quality: int = Query(1080, ge=144, le=2160),
     force: bool = Query(False),
+    user: User = Depends(current_user),
 ):
-    status = await videolib.start_save(video_id, quality, force=force)
+    if force:
+        _require_manage(video_id, user)
+    status = await videolib.start_save(
+        video_id, quality, force=force, saved_by=user.id
+    )
     return {"id": video_id, "status": status}
 
 
 @router.delete("/library/videos/{video_id}")
-async def remove_video(video_id: VideoId):
+async def remove_video(video_id: VideoId, user: User = Depends(current_user)):
+    _require_manage(video_id, user)
     return {"removed": videolib.delete_saved(video_id)}
 
 

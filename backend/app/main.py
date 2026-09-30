@@ -10,6 +10,7 @@ from .cache import make_cache
 from .config import settings
 from .db import dispose_engine, init_engine
 from .deps import current_user, require_superadmin
+from .origin_check import OriginCheckMiddleware
 from .routers import (
     auth as auth_router,
     download,
@@ -66,11 +67,12 @@ app = FastAPI(
     openapi_url=None,
 )
 
+_cors_origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
+
+app.add_middleware(OriginCheckMiddleware, allowed_origins=_cors_origins)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        o.strip() for o in settings.cors_origins.split(",") if o.strip()
-    ],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

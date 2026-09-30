@@ -1,36 +1,82 @@
 name: resonar
 
+# Production stack. Only `frontend` (nginx) publishes a port, and only on
+# 127.0.0.1 — public traffic arrives through the shared Cloudflare tunnel
+# (cloudflared on the host forwards ngyou.nexuragrid.com to localhost:8899).
+# Postgres and Redis sit on an internal network with no published ports and
+# no route out; only the backend can reach them. See docs/OPERATIONS.md.
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
 services:
   db:
-    image: postgres:16-alpine
+    image: postgres:16.15-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     restart: unless-stopped
+    <<: *hardening
+    # The entrypoint starts as root, fixes data-dir ownership, then drops to
+    # the postgres user — these are exactly the capabilities that needs.
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/run/postgresql
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-resonar}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-resonar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-resonar}
     volumes:
       - db-data:/var/lib/postgresql/data
+    networks: [data]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-resonar} -d ${POSTGRES_DB:-resonar}"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 10s
       timeout: 3s
       retries: 5
+    mem_limit: 512m
+    pids_limit: 200
+    logging: *logging
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.10-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
     restart: unless-stopped
+    <<: *hardening
+    # Entrypoint chowns /data and drops to the redis user.
+    cap_add: [CHOWN, SETGID, SETUID]
+    read_only: true
+    volumes:
+      # Named so login sessions survive `docker compose down && up`.
+      - redis-data:/data
+    networks: [data]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 3s
       retries: 5
+    mem_limit: 256m
+    pids_limit: 100
+    logging: *logging
 
   backend:
     build: ./backend
+    image: resonar-backend:local
     restart: unless-stopped
+    <<: *hardening
+    read_only: true
+    tmpfs:
+      - /tmp
     environment:
       REDIS_URL: redis://redis:6379/0
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-resonar}:${POSTGRES_PASSWORD:-resonar}@db:5432/${POSTGRES_DB:-resonar}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-resonar}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-resonar}
       CORS_ORIGINS: ${CORS_ORIGINS:-}
       STREAM_CACHE_TTL: ${STREAM_CACHE_TTL:-18000}
       SESSION_COOKIE_NAME: ${SESSION_COOKIE_NAME:-__Host-resonar_session}
@@ -61,14 +107,40 @@ services:
         condition: service_healthy
     expose:
       - "8000"
+    # `data` reaches Postgres/Redis; `edge` is the way out to YouTube,
+    # lrclib, SponsorBlock and the scrobblers, and the way in from nginx.
+    networks: [data, edge]
+    # yt-dlp + ffmpeg merges of HD videos are the heavy part.
+    mem_limit: 2g
+    pids_limit: 512
+    logging: *logging
 
   frontend:
     build: ./frontend
+    image: resonar-frontend:local
     restart: unless-stopped
+    <<: *hardening
+    read_only: true
+    tmpfs:
+      - /tmp
     ports:
-      - "${PORT:-8080}:80"
+      # Loopback only: the tunnel reaches it, the LAN and the internet don't.
+      - "127.0.0.1:${PORT:-8080}:8080"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    networks: [edge]
+    mem_limit: 128m
+    pids_limit: 100
+    logging: *logging
+
+networks:
+  # No route out of Docker: Postgres and Redis can't be reached from, or
+  # reach, anything but the backend.
+  data:
+    internal: true
+  edge: {}
 
 volumes:
   db-data:
+  redis-data:

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily resonar backup
+
+[Timer]
+OnCalendar=*-*-* 03:45:00
+RandomizedDelaySec=15m
+# Runs at next boot if the machine was off at 03:45.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
