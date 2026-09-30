@@ -5,11 +5,7 @@ from __future__ import annotations
 import re
 from urllib.parse import parse_qs, urlparse
 
-import yt_dlp
-from fastapi.concurrency import run_in_threadpool
-
-from . import ytmusic
-from .ytdlp import _base_opts
+from . import ytdlp, ytmusic
 
 
 # Only YouTube hosts are ever handed to yt-dlp. Its generic extractor will
@@ -113,31 +109,6 @@ def _dedupe(tracks: list[dict], aggressive: bool = False) -> list[dict]:
     return out
 
 
-def _ytdlp_playlist_sync(url: str, limit: int) -> dict:
-    opts = {**_base_opts(), "extract_flat": True, "playlistend": limit}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-
-    tracks: list[dict] = []
-    for entry in info.get("entries") or []:
-        vid = entry.get("id")
-        if not vid:
-            continue
-        artist = entry.get("uploader") or entry.get("channel")
-        tracks.append(
-            {
-                "id": vid,
-                "title": entry.get("title"),
-                "artists": [artist] if artist else [],
-                "album": None,
-                "duration": None,
-                "durationSeconds": entry.get("duration"),
-                "thumbnail": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
-            }
-        )
-    return {"title": info.get("title"), "tracks": tracks}
-
-
 async def import_url(url: str, limit: int = 300) -> dict:
     url = check_url(url)
     list_id = _extract_list_id(url)
@@ -162,7 +133,7 @@ async def import_url(url: str, limit: int = 300) -> dict:
             pass
 
     try:
-        res = await run_in_threadpool(_ytdlp_playlist_sync, url, eff_limit)
+        res = await ytdlp.playlist_entries(url, eff_limit)
         if res.get("tracks"):
             return _finish(res, "Mix de YouTube" if is_mix else None)
     except Exception:  # noqa: BLE001

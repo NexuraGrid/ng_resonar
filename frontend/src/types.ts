@@ -75,6 +75,8 @@ export interface SavedVideo {
   height?: number | null;
   size?: number;
   savedAt?: number;
+  /** Whether the current user may remove / re-download it (saver or admin). */
+  canDelete?: boolean;
 }
 
 export interface PlaylistSummary {

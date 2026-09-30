@@ -42,6 +42,8 @@ export default function WatchView({
 
   const saved = useSavedVideos();
   const entry = savedEntry(video.id, saved);
+  // Only whoever saved it (or an admin) may re-download or remove it.
+  const canManage = entry?.canDelete ?? true;
 
   const [quality, setQuality] = useState(1080);
   const [related, setRelated] = useState<VideoItem[]>([]);
@@ -138,35 +140,41 @@ export default function WatchView({
             <span className="badge badge--hd">
               Guardado{entry.height ? ` · ${entry.height}p` : ""}
             </span>
-            <select
-              className="savebox__quality"
-              value={quality}
-              onChange={(e) => setQuality(Number(e.target.value))}
-              aria-label="Calidad para volver a guardar"
-            >
-              {QUALITIES.map((q) => (
-                <option key={q} value={q}>
-                  {q}p
-                </option>
-              ))}
-            </select>
-            <button
-              className="btn"
-              onClick={() => saveVideo(video.id, quality, true)}
-              disabled={quality === entry.quality}
-              title="Vuelve a descargar el video en la calidad elegida"
-            >
-              <Icon name="download" size={15} /> Cambiar calidad
-            </button>
+            {canManage && (
+              <>
+                <select
+                  className="savebox__quality"
+                  value={quality}
+                  onChange={(e) => setQuality(Number(e.target.value))}
+                  aria-label="Calidad para volver a guardar"
+                >
+                  {QUALITIES.map((q) => (
+                    <option key={q} value={q}>
+                      {q}p
+                    </option>
+                  ))}
+                </select>
+                <button
+                  className="btn"
+                  onClick={() => saveVideo(video.id, quality, true)}
+                  disabled={quality === entry.quality}
+                  title="Vuelve a descargar el video en la calidad elegida"
+                >
+                  <Icon name="download" size={15} /> Cambiar calidad
+                </button>
+              </>
+            )}
             <a className="btn" href={savedVideoDownloadUrl(video.id)} download>
               <Icon name="download" size={15} /> Descargar archivo
             </a>
-            <button
-              className="btn btn--ghost"
-              onClick={() => removeSavedVideo(video.id)}
-            >
-              Quitar
-            </button>
+            {canManage && (
+              <button
+                className="btn btn--ghost"
+                onClick={() => removeSavedVideo(video.id)}
+              >
+                Quitar
+              </button>
+            )}
           </>
         )}
 

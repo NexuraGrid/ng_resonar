@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 import httpx
 import redis.asyncio as aioredis
 from fastapi import Depends, FastAPI
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import deps
@@ -28,12 +29,12 @@ from .routers import (
     videolib,
 )
 from .services import audiobatch
-from .services.videolib import cleanup_partials
+from .services import videolib as videolib_service
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    cleanup_partials()
+    videolib_service.cleanup_partials()
     audiobatch.cleanup_old()
     deps.cache = make_cache()
     deps.http = httpx.AsyncClient(
@@ -42,6 +43,7 @@ async def lifespan(app: FastAPI):
         headers={"User-Agent": "Mozilla/5.0"},
     )
     init_engine()
+    await run_in_threadpool(videolib_service.import_legacy_sidecars)
     if settings.redis_url:
         deps.redis = aioredis.from_url(
             settings.redis_url, decode_responses=True

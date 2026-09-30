@@ -17,6 +17,8 @@ export default function SavedVideoRow({
   onWatch: (v: VideoItem) => void;
 }) {
   const ready = entry.status === "ready";
+  // Older backends don't send it; the server still enforces the rule.
+  const canDelete = entry.canDelete ?? true;
   const size = humanSize(entry.size);
 
   const open = () =>
@@ -76,7 +78,7 @@ export default function SavedVideoRow({
             <Icon name="download" size={16} />
           </a>
         )}
-        {entry.status === "error" && (
+        {entry.status === "error" && canDelete && (
           <button
             className="track__icon"
             title="Reintentar"
@@ -85,13 +87,15 @@ export default function SavedVideoRow({
             <Icon name="back" size={16} />
           </button>
         )}
-        <button
-          className="track__icon"
-          title="Quitar"
-          onClick={() => removeSavedVideo(entry.id)}
-        >
-          <Icon name="x" size={16} />
-        </button>
+        {canDelete && (
+          <button
+            className="track__icon"
+            title="Quitar"
+            onClick={() => removeSavedVideo(entry.id)}
+          >
+            <Icon name="x" size={16} />
+          </button>
+        )}
       </div>
     </div>
   );

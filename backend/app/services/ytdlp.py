@@ -1,4 +1,13 @@
-"""yt-dlp helpers: search, stream-URL resolution and audio downloads."""
+"""The one module that talks to yt-dlp.
+
+Everything else (stream / video routers, the saved-video library, batch
+downloads, the playlist importer) goes through the public functions here, so
+yt-dlp options, format selection and output handling live in one place and can
+be tested with a fake ``YoutubeDL``. Names starting with ``_`` are internal.
+
+Blocking ``*_sync`` functions are for callers already on a worker thread; the
+async wrappers at the bottom are for request handlers.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +16,8 @@ import shutil
 import tempfile
 import time
 from urllib.parse import parse_qs, urlparse
+
+from typing import Callable
 
 import yt_dlp
 from fastapi.concurrency import run_in_threadpool
@@ -51,6 +62,10 @@ def _watch_url(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
 
 
+def thumbnail_url(video_id: str) -> str:
+    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+
 def _ttl_from_url(url: str) -> int:
     """Use the googlevideo `expire=` timestamp as the cache TTL when present."""
     expire = parse_qs(urlparse(url).query).get("expire", [None])[0]
@@ -59,7 +74,7 @@ def _ttl_from_url(url: str) -> int:
     return settings.stream_cache_ttl
 
 
-def _fmt_duration(seconds: float | int | None) -> str | None:
+def fmt_duration(seconds: float | int | None) -> str | None:
     if not seconds:
         return None
     total = int(seconds)
@@ -123,10 +138,10 @@ def _search_videos_sync(query: str, limit: int) -> list[dict]:
                 "id": vid,
                 "title": entry.get("title"),
                 "uploader": entry.get("uploader") or entry.get("channel"),
-                "duration": _fmt_duration(entry.get("duration")),
+                "duration": fmt_duration(entry.get("duration")),
                 "durationSeconds": entry.get("duration"),
                 "views": entry.get("view_count"),
-                "thumbnail": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
+                "thumbnail": thumbnail_url(vid),
             }
         )
     return out
@@ -140,10 +155,10 @@ def _video_info_sync(video_id: str) -> dict:
         "id": video_id,
         "title": info.get("title") or video_id,
         "uploader": info.get("uploader") or info.get("channel"),
-        "duration": _fmt_duration(info.get("duration")),
+        "duration": fmt_duration(info.get("duration")),
         "durationSeconds": info.get("duration"),
         "views": info.get("view_count"),
-        "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+        "thumbnail": thumbnail_url(video_id),
     }
 
 
@@ -198,7 +213,12 @@ def _resolve_video_sync(video_id: str) -> dict:
 # --------------------------------------------------------------------------- #
 
 
-def _download_sync(video_id: str, fmt: str) -> tuple[str, str]:
+def download_audio_sync(video_id: str, fmt: str) -> tuple[str, str]:
+    """Download one track as ``fmt`` into a fresh temp dir.
+
+    Returns ``(file_path, temp_dir)``; the caller owns ``temp_dir`` and must
+    remove it.
+    """
     outdir = tempfile.mkdtemp(prefix="resonar-dl-")
     postprocessors: list[dict] = [{"key": "FFmpegExtractAudio", "preferredcodec": fmt}]
     if fmt == "mp3":
@@ -228,6 +248,80 @@ def _download_sync(video_id: str, fmt: str) -> tuple[str, str]:
     raise RuntimeError("yt-dlp produced no audio file")
 
 
+def download_video_sync(
+    video_id: str,
+    quality: int,
+    out_dir: str,
+    on_progress: Callable[[dict], None] | None = None,
+) -> dict:
+    """Download best video+audio up to ``quality``p merged into
+    ``{out_dir}/{video_id}.mp4``. Returns the metadata worth keeping.
+
+    ``on_progress`` receives yt-dlp's progress-hook dicts.
+    """
+    mp4 = os.path.join(out_dir, f"{video_id}.mp4")
+    opts = {
+        **_base_opts(),
+        "skip_download": False,
+        "format": (
+            f"bv*[height<={quality}][ext=mp4]+ba[ext=m4a]/"
+            f"bv*[height<={quality}]+ba/b[height<={quality}]/b"
+        ),
+        "merge_output_format": "mp4",
+        "outtmpl": os.path.join(out_dir, "%(id)s.%(ext)s"),
+        "postprocessors": [{"key": "FFmpegMetadata"}],
+    }
+    if on_progress is not None:
+        opts["progress_hooks"] = [on_progress]
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(_watch_url(video_id), download=True)
+
+    if not os.path.exists(mp4):
+        for ext in ("mkv", "webm"):
+            alt = os.path.join(out_dir, f"{video_id}.{ext}")
+            if os.path.exists(alt):
+                os.replace(alt, mp4)
+                break
+    if not os.path.exists(mp4):
+        raise RuntimeError("no output file produced")
+    return {
+        "title": info.get("title"),
+        "uploader": info.get("uploader") or info.get("channel"),
+        "duration_seconds": info.get("duration"),
+        "height": info.get("height"),
+    }
+
+
+def playlist_entries_sync(url: str, limit: int) -> dict:
+    """Flat-extract up to ``limit`` entries of a playlist URL.
+
+    Callers must have validated ``url`` (see ``importer.check_url``): this
+    hands it to yt-dlp as-is.
+    """
+    opts = {**_base_opts(), "extract_flat": True, "playlistend": limit}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    tracks: list[dict] = []
+    for entry in info.get("entries") or []:
+        vid = entry.get("id")
+        if not vid:
+            continue
+        artist = entry.get("uploader") or entry.get("channel")
+        tracks.append(
+            {
+                "id": vid,
+                "title": entry.get("title"),
+                "artists": [artist] if artist else [],
+                "album": None,
+                "duration": None,
+                "durationSeconds": entry.get("duration"),
+                "thumbnail": thumbnail_url(vid),
+            }
+        )
+    return {"title": info.get("title"), "tracks": tracks}
+
+
 # --------------------------------------------------------------------------- #
 # Async wrappers
 # --------------------------------------------------------------------------- #
@@ -249,5 +343,9 @@ async def search_videos(query: str, limit: int = 24) -> list[dict]:
     return await run_in_threadpool(_search_videos_sync, query, limit)
 
 
-async def download(video_id: str, fmt: str) -> tuple[str, str]:
-    return await run_in_threadpool(_download_sync, video_id, fmt)
+async def download_audio(video_id: str, fmt: str) -> tuple[str, str]:
+    return await run_in_threadpool(download_audio_sync, video_id, fmt)
+
+
+async def playlist_entries(url: str, limit: int) -> dict:
+    return await run_in_threadpool(playlist_entries_sync, url, limit)

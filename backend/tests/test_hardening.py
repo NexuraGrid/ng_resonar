@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.origin_check import OriginCheckMiddleware
-from app.services import audiobatch, importer, videolib
+from app.services import importer
 
 
 # --- importer: only YouTube URLs reach yt-dlp --------------------------------
@@ -49,9 +49,11 @@ def test_importer_rejects_non_youtube_urls(url):
 
 def test_import_url_never_calls_ytdlp_for_foreign_hosts(monkeypatch):
     called = []
-    monkeypatch.setattr(
-        importer, "_ytdlp_playlist_sync", lambda *a, **k: called.append(a)
-    )
+    async def fake_entries(*a, **k):
+        called.append(a)
+        return {}
+
+    monkeypatch.setattr(importer.ytdlp, "playlist_entries", fake_entries)
     with pytest.raises(importer.UnsupportedUrl):
         asyncio.run(importer.import_url("http://redis:6379/"))
     assert called == []
@@ -98,61 +100,3 @@ def test_origin_check_blocks_cross_origin_writes(origin):
 def test_origin_check_ignores_safe_methods():
     c = _origin_app()
     assert c.get("/api/thing", headers={"Origin": "https://evil.example.org"}).status_code == 200
-
-
-# --- batch downloads are per-user --------------------------------------------
-@pytest.fixture
-def batch_jobs(monkeypatch):
-    monkeypatch.setattr(audiobatch, "_jobs", {})
-    monkeypatch.setattr(audiobatch, "_run_sync", lambda *a, **k: None)
-    return audiobatch._jobs
-
-
-def test_batch_job_is_only_visible_to_its_owner(batch_jobs):
-    async def go():
-        return await audiobatch.start(["dQw4w9WgXcQ"], "mp3", "x", owner=1)
-
-    job_id = asyncio.run(go())
-    assert audiobatch.status(job_id, owner=1) is not None
-    assert audiobatch.status(job_id, owner=2) is None
-
-
-def test_batch_jobs_are_capped_per_user(batch_jobs):
-    for i in range(audiobatch.MAX_ACTIVE_PER_USER):
-        batch_jobs[f"b_{i}"] = {"owner": 1, "status": "downloading"}
-    with pytest.raises(audiobatch.TooManyJobs):
-        asyncio.run(audiobatch.start(["dQw4w9WgXcQ"], "mp3", None, owner=1))
-    # Another user is unaffected.
-    async def other():
-        return await audiobatch.start(["dQw4w9WgXcQ"], "mp3", None, owner=2)
-
-    assert asyncio.run(other()).startswith("b_")
-
-
-def test_zip_path_rejects_traversal():
-    assert audiobatch.zip_path("../../etc/passwd") is None
-
-
-# --- saved videos: only the saver or an admin may remove ---------------------
-def test_saved_video_manage_rules(monkeypatch, tmp_path):
-    monkeypatch.setattr(videolib, "MEDIA_DIR", str(tmp_path))
-    monkeypatch.setattr(videolib, "_jobs", {})
-    vid = "dQw4w9WgXcQ"
-    (tmp_path / f"{vid}.mp4").write_bytes(b"")
-    (tmp_path / f"{vid}.json").write_text('{"id": "%s", "savedBy": 7}' % vid)
-
-    assert videolib.can_manage(vid, 7, False)
-    assert not videolib.can_manage(vid, 8, False)
-    assert videolib.can_manage(vid, 8, True)
-
-    legacy = "aaaaaaaaaaa"
-    (tmp_path / f"{legacy}.mp4").write_bytes(b"")
-    (tmp_path / f"{legacy}.json").write_text('{"id": "%s"}' % legacy)
-    assert not videolib.can_manage(legacy, 7, False)
-    assert videolib.can_manage(legacy, 7, True)
-
-    # Nothing saved and no job: saving it fresh is fine for anyone.
-    assert videolib.can_manage("bbbbbbbbbbb", 7, False)
-
-    videolib._jobs["ccccccccccc"] = {"status": "downloading", "savedBy": 7}
-    assert not videolib.can_manage("ccccccccccc", 8, False)

@@ -3,39 +3,47 @@
 This is what gives real quality (up to 1080p+) and re-watchable / downloadable
 files. The plain /api/videos/stream path stays as the instant low-res preview;
 once a video is saved the watch page plays the saved file instead.
+
+Where things live:
+  - the file:     ``{media_dir}/<video_id>.mp4``
+  - the metadata: a ``saved_videos`` row (the source of truth for "is it saved")
+  - in-progress:  a Redis job (``jobs.JobStore("video")``) with status/progress
+
+The library is shared; only whoever saved a video, or a superadmin, may remove
+or re-download it (``can_manage``).
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
 
-import yt_dlp
 from fastapi.concurrency import run_in_threadpool
+from sqlalchemy.orm import Session
 
 from ..config import settings
-from .ytdlp import _base_opts, _fmt_duration, _watch_url
+from ..db import SessionLocal
+from ..models import SavedVideo
+from ..repos import saved_videos as repo
+from . import ytdlp
+from .jobs import UNFINISHED, JobStore
+
+log = logging.getLogger("resonar.videolib")
 
 MEDIA_DIR = settings.media_dir
-
+store = JobStore("video")
 _sem = asyncio.Semaphore(settings.video_download_concurrency)
-
-# video_id -> {"status": "downloading"|"ready"|"error", "progress": str|None,
-#              "title": str|None, "error": str|None}
-_jobs: dict[str, dict] = {}
-
-
-def _paths(video_id: str) -> tuple[str, str]:
-    return (
-        os.path.join(MEDIA_DIR, f"{video_id}.mp4"),
-        os.path.join(MEDIA_DIR, f"{video_id}.json"),
-    )
-
-
 _PARTIAL_RE = re.compile(r"(\.part(-Frag\d+)?|\.ytdl|\.temp|\.f\d+\.(mp4|m4a|webm))$")
+_PROGRESS_MIN_INTERVAL = 1.0  # seconds between progress writes to Redis
+
+
+def _mp4(video_id: str) -> str:
+    return os.path.join(MEDIA_DIR, f"{video_id}.mp4")
 
 
 def ensure_media_dir() -> None:
@@ -54,58 +62,132 @@ def cleanup_partials() -> None:
                 pass
 
 
-def _read_meta(meta_path: str) -> dict | None:
-    try:
-        with open(meta_path, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
+def import_legacy_sidecars() -> int:
+    """One-off: turn pre-table ``<id>.json`` sidecars into rows.
 
-
-def file_path(video_id: str) -> str | None:
-    mp4, meta = _paths(video_id)
-    return mp4 if os.path.exists(mp4) and os.path.exists(meta) else None
-
-
-def meta_for(video_id: str) -> dict | None:
-    _, meta_path = _paths(video_id)
-    return _read_meta(meta_path)
-
-
-def list_saved() -> list[dict]:
+    Each imported sidecar is renamed to ``.json.migrated``. Safe to run on
+    every start: once renamed there is nothing left to import.
+    """
     ensure_media_dir()
+    imported = 0
+    with SessionLocal() as db:
+        for name in sorted(os.listdir(MEDIA_DIR)):
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(MEDIA_DIR, name)
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    meta = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                continue
+            vid = meta.get("id") or name[:-5]
+            if not re.fullmatch(r"[A-Za-z0-9_-]{11}", vid) or not os.path.exists(_mp4(vid)):
+                continue
+            repo.upsert(
+                db,
+                video_id=vid,
+                saved_by=meta.get("savedBy"),
+                title=meta.get("title") or vid,
+                uploader=meta.get("uploader"),
+                duration_seconds=meta.get("durationSeconds"),
+                height=meta.get("height"),
+                quality=meta.get("quality") or 1080,
+                size_bytes=os.path.getsize(_mp4(vid)),
+                saved_at=datetime.fromtimestamp(
+                    meta.get("savedAt") or time.time(), tz=timezone.utc
+                ),
+            )
+            db.commit()
+            os.replace(path, path + ".migrated")
+            imported += 1
+    if imported:
+        log.info("imported %d legacy saved-video sidecars", imported)
+    return imported
+
+
+def _row_json(row: SavedVideo) -> dict:
+    return {
+        "id": row.video_id,
+        "title": row.title,
+        "uploader": row.uploader,
+        "duration": ytdlp.fmt_duration(row.duration_seconds),
+        "durationSeconds": row.duration_seconds,
+        "height": row.height,
+        "quality": row.quality,
+        "thumbnail": ytdlp.thumbnail_url(row.video_id),
+        "savedAt": int(row.saved_at.timestamp()),
+        "size": row.size_bytes,
+        "status": "ready",
+    }
+
+
+def _job_json(video_id: str, job: dict) -> dict:
+    status = job.get("status")
+    return {
+        "id": video_id,
+        "title": job.get("title") or video_id,
+        "thumbnail": ytdlp.thumbnail_url(video_id),
+        # The client only knows downloading / ready / error.
+        "status": "downloading" if status == "queued" else status,
+        "progress": job.get("progress"),
+        "error": job.get("error"),
+        "savedAt": int(job.get("createdAt") or 0),
+    }
+
+
+def _may_manage(saved_by: int | None, user_id: int, is_admin: bool) -> bool:
+    return is_admin or (saved_by is not None and saved_by == user_id)
+
+
+async def list_saved(db: Session, user_id: int, is_admin: bool) -> list[dict]:
+    rows = await run_in_threadpool(repo.list_, db)
     items: dict[str, dict] = {}
-
-    for name in sorted(os.listdir(MEDIA_DIR)):
-        if not name.endswith(".json"):
-            continue
-        meta = _read_meta(os.path.join(MEDIA_DIR, name))
-        if not meta:
-            continue
-        vid = meta.get("id") or name[:-5]
-        mp4, _ = _paths(vid)
-        if not os.path.exists(mp4):
-            continue
-        meta["status"] = "ready"
-        meta["size"] = os.path.getsize(mp4)
-        items[vid] = meta
-
-    for vid, job in _jobs.items():
-        if job["status"] == "ready" and vid in items:
+    for row in rows:
+        if os.path.exists(_mp4(row.video_id)):
+            items[row.video_id] = {
+                **_row_json(row),
+                "canDelete": _may_manage(row.saved_by, user_id, is_admin),
+            }
+    for vid, job in (await store.all()).items():
+        if job.get("status") == "ready" or vid in items:
             continue
         items[vid] = {
-            "id": vid,
-            "title": job.get("title") or vid,
-            "thumbnail": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
-            "status": job["status"],
-            "progress": job.get("progress"),
-            "error": job.get("error"),
+            **_job_json(vid, job),
+            "canDelete": job.get("status") not in UNFINISHED
+            or _may_manage(job.get("savedBy"), user_id, is_admin),
         }
-
     return sorted(items.values(), key=lambda m: m.get("savedAt", 0), reverse=True)
 
 
-def _purge(video_id: str) -> None:
+async def can_manage(db: Session, video_id: str, user_id: int, is_admin: bool) -> bool:
+    """Whether a user may delete / force re-download ``video_id``.
+
+    A saved video: only its saver or an admin. Nothing saved: anyone, unless
+    someone else's download of it is still running.
+    """
+    if is_admin:
+        return True
+    row = await run_in_threadpool(repo.get, db, video_id)
+    if row is not None:
+        return row.saved_by == user_id
+    job = await store.get(video_id)
+    if job and job.get("status") in UNFINISHED:
+        return job.get("savedBy") == user_id
+    return True
+
+
+async def file_path(db: Session, video_id: str) -> str | None:
+    row = await run_in_threadpool(repo.get, db, video_id)
+    path = _mp4(video_id)
+    return path if row is not None and os.path.exists(path) else None
+
+
+async def title_for(db: Session, video_id: str) -> str | None:
+    row = await run_in_threadpool(repo.get, db, video_id)
+    return row.title if row else None
+
+
+def _purge_files(video_id: str) -> None:
     if not os.path.isdir(MEDIA_DIR):
         return
     for name in os.listdir(MEDIA_DIR):
@@ -116,139 +198,108 @@ def _purge(video_id: str) -> None:
                 pass
 
 
-def _on_progress(video_id: str, d: dict) -> None:
-    job = _jobs.get(video_id)
-    if not job:
-        return
-    if d.get("status") == "downloading":
-        pct = (d.get("_percent_str") or "").strip()
-        job["progress"] = f"descargando {pct}" if pct else "descargando…"
-        title = (d.get("info_dict") or {}).get("title")
-        if title and not job.get("title"):
-            job["title"] = title
-    elif d.get("status") == "finished":
-        job["progress"] = "uniendo audio y video…"
+def _progress_hook(video_id: str):
+    """yt-dlp progress hook (runs on the download thread), throttled."""
+    last = {"t": 0.0, "text": None}
+
+    def hook(d: dict) -> None:
+        fields: dict = {}
+        if d.get("status") == "downloading":
+            pct = (d.get("_percent_str") or "").strip()
+            fields["progress"] = f"descargando {pct}" if pct else "descargando…"
+            title = (d.get("info_dict") or {}).get("title")
+            if title:
+                fields["title"] = title
+        elif d.get("status") == "finished":
+            fields["progress"] = "uniendo audio y video…"
+        else:
+            return
+        now = time.monotonic()
+        if fields["progress"] == last["text"] or (
+            now - last["t"] < _PROGRESS_MIN_INTERVAL and d.get("status") != "finished"
+        ):
+            return
+        last["t"], last["text"] = now, fields["progress"]
+        store.update_from_thread(video_id, **fields)
+
+    return hook
 
 
-def can_manage(video_id: str, user_id: int, is_admin: bool) -> bool:
-    """Whether a user may delete / re-download a saved video.
-
-    The library is shared (everyone sees every saved video), but only whoever
-    saved it or a superadmin may remove it. Videos saved before ``savedBy`` was
-    recorded are admin-only.
-    """
-    if is_admin:
-        return True
-    job = _jobs.get(video_id)
-    if job and job.get("savedBy") is not None:
-        return job["savedBy"] == user_id
-    meta = meta_for(video_id)
-    if meta is None:
-        # Nothing saved and no job: there is nothing of anyone else's to touch.
-        return job is None
-    return meta.get("savedBy") == user_id
+def _record(video_id: str, quality: int, saved_by: int | None, meta: dict) -> None:
+    with SessionLocal() as db:
+        repo.upsert(
+            db,
+            video_id=video_id,
+            saved_by=saved_by,
+            title=meta.get("title") or video_id,
+            uploader=meta.get("uploader"),
+            duration_seconds=meta.get("duration_seconds"),
+            height=meta.get("height"),
+            quality=quality,
+            size_bytes=os.path.getsize(_mp4(video_id)),
+            saved_at=datetime.now(tz=timezone.utc),
+        )
+        db.commit()
 
 
-def _download_sync(video_id: str, quality: int, saved_by: int | None = None) -> dict:
-    mp4, meta_path = _paths(video_id)
-    opts = {
-        **_base_opts(),
-        "skip_download": False,
-        "format": (
-            f"bv*[height<={quality}][ext=mp4]+ba[ext=m4a]/"
-            f"bv*[height<={quality}]+ba/b[height<={quality}]/b"
-        ),
-        "merge_output_format": "mp4",
-        "outtmpl": os.path.join(MEDIA_DIR, "%(id)s.%(ext)s"),
-        "postprocessors": [{"key": "FFmpegMetadata"}],
-        "progress_hooks": [lambda d: _on_progress(video_id, d)],
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(_watch_url(video_id), download=True)
-
-    if not os.path.exists(mp4):
-        for ext in ("mkv", "webm"):
-            alt = os.path.join(MEDIA_DIR, f"{video_id}.{ext}")
-            if os.path.exists(alt):
-                os.replace(alt, mp4)
-                break
-    if not os.path.exists(mp4):
-        raise RuntimeError("no output file produced")
-
-    meta = {
-        "id": video_id,
-        "title": info.get("title"),
-        "uploader": info.get("uploader") or info.get("channel"),
-        "duration": _fmt_duration(info.get("duration")),
-        "durationSeconds": info.get("duration"),
-        "height": info.get("height"),
-        "quality": quality,
-        "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
-        "savedAt": int(time.time()),
-        "savedBy": saved_by,
-    }
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f)
-    return meta
+async def _run(video_id: str, quality: int, saved_by: int | None) -> None:
+    async with store.running(video_id):
+        async with _sem:
+            await store.update(video_id, status="downloading")
+            try:
+                ensure_media_dir()
+                meta = await run_in_threadpool(
+                    ytdlp.download_video_sync,
+                    video_id,
+                    quality,
+                    MEDIA_DIR,
+                    _progress_hook(video_id),
+                )
+                if await store.get(video_id) is None:
+                    # Removed while it downloaded: don't resurrect it.
+                    _purge_files(video_id)
+                    return
+                await run_in_threadpool(_record, video_id, quality, saved_by, meta)
+            except Exception as exc:  # noqa: BLE001
+                _purge_files(video_id)
+                await store.update(
+                    video_id, status="error", progress=None, error=str(exc)
+                )
+            else:
+                await store.delete(video_id)
 
 
 async def start_save(
-    video_id: str, quality: int, *, force: bool = False, saved_by: int | None = None
+    db: Session,
+    video_id: str,
+    quality: int,
+    *,
+    force: bool = False,
+    saved_by: int | None = None,
 ) -> str:
     if force:
-        delete_saved(video_id)
-
-    if file_path(video_id):
+        await delete_saved(db, video_id)
+    elif await file_path(db, video_id):
         return "ready"
-
-    job = _jobs.get(video_id)
-    if job and job["status"] == "downloading":
+    job = await store.get(video_id)
+    if job and job.get("status") in UNFINISHED:
         return "downloading"
-
-    _jobs[video_id] = {
-        "status": "downloading",
-        "progress": "en cola…",
-        "title": None,
-        "error": None,
-        "savedBy": saved_by,
-    }
-
-    async def _run() -> None:
-        async with _sem:
-            try:
-                meta = await run_in_threadpool(
-                    _download_sync, video_id, quality, saved_by
-                )
-                _jobs[video_id] = {
-                    "savedBy": saved_by,
-                    "status": "ready",
-                    "progress": None,
-                    "title": meta.get("title"),
-                    "error": None,
-                }
-            except Exception as exc:  # noqa: BLE001
-                _purge(video_id)
-                _jobs[video_id] = {
-                    "savedBy": saved_by,
-                    "status": "error",
-                    "progress": None,
-                    "title": None,
-                    "error": str(exc),
-                }
-
-    asyncio.create_task(_run())
+    await store.create(
+        video_id,
+        status="queued",
+        progress="en cola…",
+        title=None,
+        error=None,
+        savedBy=saved_by,
+        createdAt=time.time(),
+    )
+    asyncio.create_task(_run(video_id, quality, saved_by))
     return "downloading"
 
 
-def delete_saved(video_id: str) -> bool:
-    mp4, meta_path = _paths(video_id)
-    removed = False
-    for path in (mp4, meta_path):
-        if os.path.exists(path):
-            try:
-                os.remove(path)
-                removed = True
-            except OSError:
-                pass
-    _jobs.pop(video_id, None)
-    return removed
+async def delete_saved(db: Session, video_id: str) -> bool:
+    removed = await run_in_threadpool(repo.delete_, db, video_id)
+    had_file = os.path.exists(_mp4(video_id))
+    _purge_files(video_id)
+    await store.delete(video_id)
+    return removed or had_file
