@@ -1,425 +1,40 @@
-import { useEffect, useRef, useState } from "react";
-import { flushSync } from "react-dom";
-import Plyr from "plyr";
-import "plyr/dist/plyr.css";
+import { useState } from "react";
 
-import {
-  downloadUrl,
-  recordPlay,
-  related,
-  scrobbleNowPlaying,
-  scrobbleSubmit,
-  streamUrl,
-} from "../api";
-import { isSaved, toggleLibrary, useLibrary } from "../state/library";
-import {
-  downloadOffline,
-  getOfflineBlob,
-  isOffline,
-  offlineStatus,
-  removeOffline,
-  useOfflineTracks,
-} from "../state/offline";
 import { usePlayer } from "../state/player";
-import { claimPlayback, isVideoActive, onPlaybackClaim } from "../state/mediabus";
-import { registerSeeker, setNowPlaying } from "../state/nowPlaying";
-import { scrobblingOn } from "../state/settings";
-import { useVolumeLeveling } from "../lib/useVolumeLeveling";
-import AddToPlaylistButton from "./AddToPlaylistButton";
+import { useRadio } from "../lib/radio";
+import { useAudioEngine } from "../lib/useAudioEngine";
+import { useExpandedPlayer } from "../lib/useExpandedPlayer";
+import { usePlayerKeyboard } from "../lib/usePlayerKeyboard";
 import ArtistLinks from "./ArtistLinks";
 import Icon from "./Icon";
-import QueuePanel from "./QueuePanel";
 import LyricsPanel from "./LyricsPanel";
+import PlayerActions from "./PlayerActions";
+import QueuePanel from "./QueuePanel";
 
-const POS_KEY = "resonar:pos";
-
-function reducedMotion(): boolean {
-  return (
-    typeof window.matchMedia === "function" &&
-    window.matchMedia("(prefers-reduced-motion: reduce)").matches
-  );
-}
-
+/**
+ * The music player footer. Composition only: playback lives in
+ * `useAudioEngine`, the radio in `useRadio`, full-screen in
+ * `useExpandedPlayer`, shortcuts in `usePlayerKeyboard`, and the toolbar in
+ * `PlayerActions`.
+ */
 export default function PlayerBar() {
-  const {
+  const { current, next, prev, hasNext, radio, toggleRadio, appendMany, queue, index } =
+    usePlayer();
+  const upcoming = Math.max(0, queue.length - index - 1);
+  const [queueOpen, setQueueOpen] = useState(false);
+  const [lyricsOpen, setLyricsOpen] = useState(false);
+  const { expanded, open: openExpanded, close: closeExpanded } = useExpandedPlayer(!!current);
+
+  const extendRadio = useRadio({ radio, current, hasNext, queue, appendMany });
+  const engine = useAudioEngine({
     current,
     next,
     prev,
-    hasNext,
-    radio,
-    toggleRadio,
-    appendMany,
-    queue,
-    index,
-  } = usePlayer();
-  const upcoming = Math.max(0, queue.length - index - 1);
-  const library = useLibrary();
-  const offlineTracks = useOfflineTracks();
-  const offlineOn = current ? isOffline(current.id, offlineTracks) : false;
-  const offlineBusy = current
-    ? offlineStatus(current.id, offlineTracks) === "downloading"
-    : false;
-
-  const audioRef = useRef<HTMLAudioElement>(null);
-  const plyrRef = useRef<Plyr | null>(null);
-  const [queueOpen, setQueueOpen] = useState(false);
-  const [lyricsOpen, setLyricsOpen] = useState(false);
-
-  // Full-screen now-playing = pure CSS expansion of this same footer. No new
-  // component, no second <audio>/Plyr — only this boolean flips.
-  const [expanded, setExpanded] = useState(false);
-
-  function flipExpanded(v: boolean) {
-    if (
-      typeof document.startViewTransition === "function" &&
-      !reducedMotion()
-    ) {
-      document.startViewTransition(() => flushSync(() => setExpanded(v)));
-    } else {
-      setExpanded(v);
-    }
-  }
-
-  function openExpanded() {
-    if (!current || expanded) return;
-    // Push a history entry so the Back gesture collapses instead of leaving.
-    history.pushState({ ...(history.state || {}), np: true }, "");
-    flipExpanded(true);
-  }
-
-  function closeExpanded() {
-    if ((history.state as NavHistoryState | null)?.np) history.back();
-    else flipExpanded(false);
-  }
-
-  useEffect(() => {
-    const onPop = (e: PopStateEvent) => {
-      flipExpanded(Boolean((e.state as NavHistoryState | null)?.np));
-    };
-    window.addEventListener("popstate", onPop);
-    return () => window.removeEventListener("popstate", onPop);
-  }, []);
-
-  const nextRef = useRef(next);
-  const prevRef = useRef(prev);
-  nextRef.current = next;
-  prevRef.current = prev;
-
-  const currentRef = useRef(current);
-  currentRef.current = current;
-  const scrobbledRef = useRef(false);
-  // Set while an autoplay attempt was blocked (typically the "ended" → next
-  // track jump firing while the app is backgrounded/screen off) so we can
-  // retry as soon as we're back in front of the user, instead of leaving
-  // playback silently stuck until they dig up the "siguiente" button.
-  const resumeCleanupRef = useRef<(() => void) | null>(null);
-  function scheduleAutoplayResume() {
-    resumeCleanupRef.current?.();
-    function attempt() {
-      cleanup();
-      audioRef.current?.play().catch(() => {
-        /* still blocked; nothing more to do until a real interaction */
-      });
-    }
-    function onVisible() {
-      if (document.visibilityState === "visible") attempt();
-    }
-    function cleanup() {
-      document.removeEventListener("visibilitychange", onVisible);
-      window.removeEventListener("pointerdown", attempt);
-      resumeCleanupRef.current = null;
-    }
-    document.addEventListener("visibilitychange", onVisible);
-    window.addEventListener("pointerdown", attempt, { once: true });
-    resumeCleanupRef.current = cleanup;
-  }
-  // True only for the very first track when it came back from a persisted queue
-  // (Ctrl+Shift+R): load it ready-to-play but don't autoplay / re-log it.
-  const restoringRef = useRef<boolean>(!!current);
-
-  // ---- Web Audio volume leveling (engaged only when turned on) ----
-  const { leveled, toggleLevel, resume: resumeAudioCtx, close: closeAudioCtx } =
-    useVolumeLeveling(audioRef);
-
-  // ---- Plyr lifecycle ----
-  useEffect(() => {
-    if (!audioRef.current) return;
-    const player = new Plyr(audioRef.current, {
-      controls: [
-        "play",
-        "progress",
-        "current-time",
-        "duration",
-        "mute",
-        "volume",
-      ],
-      seekTime: 5,
-      storage: { enabled: true, key: "resonar" },
-    });
-    plyrRef.current = player;
-    registerSeeker((t) => {
-      try {
-        player.currentTime = t;
-      } catch {
-        /* ignore */
-      }
-    });
-
-    let lastPush = 0;
-    let lastPosSave = 0;
-    const onTime = () => {
-      const now = performance.now();
-      if (now - lastPush < 200) return;
-      lastPush = now;
-      const t = player.currentTime;
-      const d = player.duration || 0;
-      setNowPlaying({ time: t, duration: d });
-
-      // Remember where we are so a reload can resume the same spot.
-      const cid = currentRef.current?.id;
-      if (cid && t > 3 && now - lastPosSave > 4000) {
-        lastPosSave = now;
-        try {
-          localStorage.setItem(POS_KEY, JSON.stringify({ id: cid, t }));
-        } catch {
-          /* ignore */
-        }
-      }
-
-      if ("mediaSession" in navigator && d > 0 && Number.isFinite(d)) {
-        try {
-          navigator.mediaSession.setPositionState?.({
-            duration: d,
-            playbackRate: 1,
-            position: Math.min(t, d),
-          });
-        } catch {
-          /* position can briefly exceed duration */
-        }
-      }
-
-      const c = currentRef.current;
-      if (c && !scrobbledRef.current && d > 30 && (t >= 240 || t >= d / 2)) {
-        scrobbledRef.current = true;
-        if (scrobblingOn()) scrobbleSubmit(c);
-      }
-    };
-    player.on("timeupdate", onTime);
-    player.on("play", () => {
-      claimPlayback("music");
-      resumeAudioCtx();
-      setNowPlaying({ paused: false });
-      if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
-    });
-    player.on("pause", () => {
-      setNowPlaying({ paused: true });
-      if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
-    });
-
-    const off = onPlaybackClaim((kind) => {
-      if (kind !== "music") audioRef.current?.pause();
-    });
-    return () => {
-      off();
-      resumeCleanupRef.current?.();
-      player.destroy();
-      closeAudioCtx();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // ---- "Radio": fill the queue with similar songs as soon as it's turned on
-  // (don't wait for the current track to end), when there's nothing queued after
-  // the current one. ----
-  const radioWasOn = useRef(radio);
-  useEffect(() => {
-    const turnedOn = radio && !radioWasOn.current;
-    radioWasOn.current = radio;
-    if (!turnedOn || !current || hasNext) return;
-    let alive = true;
-    related(current.id)
-      .then((more) => {
-        if (!alive) return;
-        const have = new Set(queue.map((t) => t.id));
-        const fresh = more.filter((t) => !have.has(t.id)).slice(0, 20);
-        if (fresh.length) appendMany(fresh);
-      })
-      .catch(() => {});
-    return () => {
-      alive = false;
-    };
-  }, [radio, current, hasNext, queue, appendMany]);
-
-  // ---- "Radio": extend the queue with similar songs at the end ----
-  useEffect(() => {
-    const player = plyrRef.current;
-    if (!player) return;
-    const onEnded = async () => {
-      if (radio && !hasNext && current) {
-        try {
-          const more = await related(current.id);
-          const have = new Set(queue.map((t) => t.id));
-          const fresh = more.filter((t) => !have.has(t.id)).slice(0, 20);
-          if (fresh.length) appendMany(fresh);
-        } catch {
-          /* ignore */
-        }
-      }
-      nextRef.current();
-    };
-    player.on("ended", onEnded);
-    return () => player.off("ended", onEnded);
-  }, [radio, hasNext, current, queue, appendMany]);
-
-  // ---- Keyboard shortcuts (music only) ----
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const el = e.target as HTMLElement | null;
-      if (
-        el &&
-        (el.tagName === "INPUT" ||
-          el.tagName === "TEXTAREA" ||
-          el.tagName === "SELECT" ||
-          el.isContentEditable)
-      )
-        return;
-      if (isVideoActive()) return;
-      const p = plyrRef.current;
-      if (!p) return;
-      switch (e.key) {
-        case " ":
-          e.preventDefault();
-          p.togglePlay();
-          break;
-        case "ArrowRight":
-          p.currentTime = Math.min(p.duration || Infinity, p.currentTime + 5);
-          break;
-        case "ArrowLeft":
-          p.currentTime = Math.max(0, p.currentTime - 5);
-          break;
-        case "n":
-        case "N":
-          nextRef.current();
-          break;
-        case "p":
-        case "P":
-          prevRef.current();
-          break;
-        case "m":
-        case "M":
-          p.muted = !p.muted;
-          break;
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
-  // ---- Load current track ----
-  useEffect(() => {
-    const audio = audioRef.current;
-    if (!audio || !current) return;
-    const track = current;
-
-    const restoring = restoringRef.current;
-    restoringRef.current = false;
-
-    // A new track supersedes any pending "resume the blocked autoplay"
-    // listener from a previous jump.
-    resumeCleanupRef.current?.();
-
-    scrobbledRef.current = false;
-
-    let cancelled = false;
-    let revokeSrc: (() => void) | null = null;
-
-    (async () => {
-      // Prefer the on-device copy when there is one, so a downloaded track
-      // keeps playing with no connection at all — same track, just a
-      // different source.
-      const blob = await getOfflineBlob(track.id).catch(() => null);
-      if (cancelled) return;
-      if (blob) {
-        const url = URL.createObjectURL(blob);
-        revokeSrc = () => URL.revokeObjectURL(url);
-        audio.src = url;
-      } else {
-        audio.src = streamUrl(track.id);
-      }
-
-      if (restoring) {
-        // Coming back from a hard reload: load ready-to-play at the saved spot,
-        // but DON'T autoplay (browser blocks it) or re-log the play. Only here do
-        // we resume a saved position — navigating to a track any other way
-        // (including "anterior" back to a finished song) must start it from 0.
-        try {
-          const saved = JSON.parse(localStorage.getItem(POS_KEY) || "null") as {
-            id?: string;
-            t?: number;
-          } | null;
-          if (saved && saved.id === track.id && (saved.t ?? 0) > 3) {
-            const onMeta = () => {
-              try {
-                audio.currentTime = saved.t as number;
-              } catch {
-                /* ignore */
-              }
-              audio.removeEventListener("loadedmetadata", onMeta);
-            };
-            audio.addEventListener("loadedmetadata", onMeta);
-          }
-        } catch {
-          /* ignore */
-        }
-      } else {
-        audio.play().catch(() => {
-          // Blocked — commonly this jump was triggered by "ended" while the
-          // app was backgrounded. Reflect the real state on the lock screen
-          // (otherwise it keeps showing a dead "pause" button) and resume as
-          // soon as we're foregrounded again or get any tap.
-          if ("mediaSession" in navigator) {
-            navigator.mediaSession.playbackState = "paused";
-          }
-          scheduleAutoplayResume();
-        });
-        recordPlay(track, "song", "player");
-        if (scrobblingOn()) scrobbleNowPlaying(track);
-      }
-
-      if ("mediaSession" in navigator) {
-        const ms = navigator.mediaSession;
-        ms.metadata = new MediaMetadata({
-          title: track.title,
-          artist: track.artists.join(", "),
-          album: track.album ?? "",
-          artwork: track.thumbnail
-            ? [{ src: track.thumbnail, sizes: "544x544", type: "image/jpeg" }]
-            : [],
-        });
-        const seekBy = (delta: number) => {
-          const a = audioRef.current;
-          if (a) a.currentTime = Math.max(0, a.currentTime + delta);
-        };
-        ms.setActionHandler("play", () => audioRef.current?.play());
-        ms.setActionHandler("pause", () => audioRef.current?.pause());
-        ms.setActionHandler("stop", () => audioRef.current?.pause());
-        ms.setActionHandler("previoustrack", () => prevRef.current());
-        ms.setActionHandler("nexttrack", () => nextRef.current());
-        ms.setActionHandler("seekbackward", (d) => seekBy(-(d.seekOffset || 10)));
-        ms.setActionHandler("seekforward", (d) => seekBy(d.seekOffset || 10));
-        ms.setActionHandler("seekto", (d) => {
-          if (d.seekTime != null && audioRef.current) {
-            audioRef.current.currentTime = d.seekTime;
-          }
-        });
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-      revokeSrc?.();
-    };
-  }, [current]);
+    onEnded: () => {
+      void extendRadio().then(() => engine.actionsRef.current.next());
+    },
+  });
+  usePlayerKeyboard(engine.plyrRef, engine.actionsRef);
 
   return (
     <>
@@ -465,15 +80,9 @@ export default function PlayerBar() {
             </div>
           )}
           <div className="player__text">
-            <span className="player__title">
-              {current?.title ?? "Nada sonando"}
-            </span>
+            <span className="player__title">{current?.title ?? "Nada sonando"}</span>
             <span className="player__artist">
-              {current ? (
-                <ArtistLinks artists={current.artists} />
-              ) : (
-                "Elige una canción"
-              )}
+              {current ? <ArtistLinks artists={current.artists} /> : "Elige una canción"}
             </span>
           </div>
         </button>
@@ -487,103 +96,21 @@ export default function PlayerBar() {
               <Icon name="skipForward" size={16} />
             </button>
           </div>
-          <audio ref={audioRef} />
+          <audio ref={engine.audioRef} />
         </div>
 
-        <div className="player__actions">
-          <button
-            className={
-              "player__toggle" +
-              (current && isSaved(current.id, library) ? " is-on" : "")
-            }
-            onClick={() => current && toggleLibrary(current)}
-            disabled={!current}
-            title={
-              current && isSaved(current.id, library)
-                ? "Quitar de favoritos"
-                : "Añadir a favoritos"
-            }
-            aria-label="Favorito"
-          >
-            <Icon
-              name="heart"
-              size={16}
-              filled={!!current && isSaved(current.id, library)}
-            />
-          </button>
-          {current && (
-            <AddToPlaylistButton
-              track={current}
-              className="player__toggle"
-              size={16}
-            />
-          )}
-          <button
-            className={"player__toggle" + (leveled ? " is-on" : "")}
-            onClick={toggleLevel}
-            title="Nivelar volumen entre canciones"
-            aria-label="Nivelar volumen"
-          >
-            <Icon name="level" size={16} />
-          </button>
-          <button
-            className={"player__toggle" + (lyricsOpen ? " is-on" : "")}
-            onClick={() => setLyricsOpen((v) => !v)}
-            title="Letra"
-            aria-label="Letra"
-          >
-            <Icon name="lyrics" size={16} />
-          </button>
-          <button
-            className={"player__toggle" + (radio ? " is-on" : "")}
-            onClick={toggleRadio}
-            title="Radio: seguir con canciones similares al terminar"
-            aria-label="Radio"
-          >
-            <Icon name="radio" size={16} />
-          </button>
-          <button
-            className={"player__toggle" + (queueOpen ? " is-on" : "")}
-            onClick={() => setQueueOpen((v) => !v)}
-            title="Cola"
-            aria-label="Cola"
-          >
-            <Icon name="queue" size={16} />
-            {upcoming > 0 && (
-              <span className="player__badge">{upcoming}</span>
-            )}
-          </button>
-          {current && (
-            <button
-              className={"player__toggle" + (offlineOn ? " is-on" : "")}
-              onClick={() =>
-                offlineOn ? removeOffline(current.id) : downloadOffline(current)
-              }
-              disabled={offlineBusy}
-              title={
-                offlineOn
-                  ? "Quitar de escuchar sin conexión"
-                  : "Escuchar sin conexión"
-              }
-              aria-label="Escuchar sin conexión"
-            >
-              {offlineBusy ? (
-                <span className="spinner" />
-              ) : (
-                <Icon name="offline" size={16} filled={offlineOn} />
-              )}
-            </button>
-          )}
-          {current && (
-            <a
-              className="player__download"
-              href={downloadUrl(current.id, "mp3")}
-              download
-            >
-              <Icon name="download" size={14} /> MP3
-            </a>
-          )}
-        </div>
+        <PlayerActions
+          current={current}
+          leveled={engine.leveled}
+          onToggleLevel={engine.toggleLevel}
+          lyricsOpen={lyricsOpen}
+          onToggleLyrics={() => setLyricsOpen((v) => !v)}
+          radio={radio}
+          onToggleRadio={toggleRadio}
+          queueOpen={queueOpen}
+          onToggleQueue={() => setQueueOpen((v) => !v)}
+          upcoming={upcoming}
+        />
       </footer>
     </>
   );
