@@ -1,0 +1,12 @@
+[Unit]
+Description=resonar backup (Postgres dump + app data)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Installed by scripts/install-backup-timer.sh, which fills in the repo path.
+WorkingDirectory=@REPO_DIR@
+ExecStart=@REPO_DIR@/scripts/backup.sh
+Nice=10
+IOSchedulingClass=idle
