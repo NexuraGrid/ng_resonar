@@ -28,6 +28,7 @@ export default function PlayerBar() {
   const extendRadio = useRadio({ radio, current, hasNext, queue, appendMany });
   const engine = useAudioEngine({
     current,
+    upcoming: queue[index + 1],
     next,
     prev,
     onEnded: () => {

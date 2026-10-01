@@ -161,6 +161,11 @@ export async function apiDeleteSavedVideo(id: string): Promise<void> {
 }
 
 export const streamUrl = (id: string) => `${BASE}/stream/${id}`;
+
+/** Ask the server to resolve a track's stream now, so it starts instantly later. */
+export async function prefetchStream(id: string): Promise<void> {
+  await req(`/stream/${id}/prefetch`, { method: "POST" });
+}
 export const videoStreamUrl = (id: string) => `${BASE}/videos/stream/${id}`;
 export const savedVideoFileUrl = (id: string) => `${BASE}/library/videos/${id}/file`;
 export const savedVideoDownloadUrl = (id: string) =>
