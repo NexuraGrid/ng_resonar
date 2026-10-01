@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 
 from ..deps import get_cache, get_http
 from ..services import ytdlp
@@ -30,3 +30,11 @@ async def stream(video_id: VideoId, request: Request):
         request,
         lambda force=False: _resolved(video_id, force=force),
     )
+
+
+@router.post("/stream/{video_id}/prefetch", status_code=204)
+async def prefetch(video_id: VideoId) -> Response:
+    """Resolve (and cache) the stream URL ahead of time, so the player can
+    start the next song in the queue without waiting on yt-dlp."""
+    await _resolved(video_id)
+    return Response(status_code=204)

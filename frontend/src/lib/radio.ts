@@ -12,9 +12,10 @@ export function freshTracks(candidates: Track[], queue: Track[]): Track[] {
 /**
  * "Radio": keep the queue going with songs similar to the current one.
  *
- * Fills the queue as soon as radio is switched on (if nothing is queued after
- * the current track), and returns `extendIfNeeded` for the "track ended"
- * handler to top the queue up before advancing.
+ * Whenever radio is on and the current track is the last one queued, fetches
+ * similar songs right away — not when the track ends — so the player always
+ * has a next track lined up and can move on with the screen off. Also
+ * returns `extendIfNeeded` for the "track ended" handler, as a fallback.
  */
 export function useRadio({
   radio,
@@ -29,23 +30,30 @@ export function useRadio({
   queue: Track[];
   appendMany: (tracks: Track[]) => void;
 }): () => Promise<void> {
-  const radioWasOn = useRef(radio);
+  const queueRef = useRef(queue);
+  queueRef.current = queue;
+  const appendRef = useRef(appendMany);
+  appendRef.current = appendMany;
+  // One look-ahead fetch per track, even if nothing fresh comes back.
+  const filledFor = useRef<string | null>(null);
+
   useEffect(() => {
-    const turnedOn = radio && !radioWasOn.current;
-    radioWasOn.current = radio;
-    if (!turnedOn || !current || hasNext) return;
+    if (!radio) filledFor.current = null;
+    if (!radio || !current || hasNext || filledFor.current === current.id) return;
+    filledFor.current = current.id;
     let alive = true;
     related(current.id)
       .then((more) => {
         if (!alive) return;
-        const fresh = freshTracks(more, queue);
-        if (fresh.length) appendMany(fresh);
+        const fresh = freshTracks(more, queueRef.current);
+        if (fresh.length) appendRef.current(fresh);
       })
       .catch(() => {});
     return () => {
       alive = false;
+      if (filledFor.current === current.id) filledFor.current = null;
     };
-  }, [radio, current, hasNext, queue, appendMany]);
+  }, [radio, current, hasNext]);
 
   return useCallback(async () => {
     if (!radio || hasNext || !current) return;

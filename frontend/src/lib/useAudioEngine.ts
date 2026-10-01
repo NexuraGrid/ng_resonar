@@ -2,7 +2,13 @@ import { useEffect, useRef } from "react";
 import Plyr from "plyr";
 import "plyr/dist/plyr.css";
 
-import { recordPlay, scrobbleNowPlaying, scrobbleSubmit, streamUrl } from "../api";
+import {
+  prefetchStream,
+  recordPlay,
+  scrobbleNowPlaying,
+  scrobbleSubmit,
+  streamUrl,
+} from "../api";
 import { claimPlayback, onPlaybackClaim } from "../state/mediabus";
 import { registerSeeker, setNowPlaying } from "../state/nowPlaying";
 import { getOfflineBlob } from "../state/offline";
@@ -26,13 +32,40 @@ function shouldScrobble(t: number, duration: number): boolean {
   return duration > 30 && (t >= 240 || t >= duration / 2);
 }
 
+interface Loaded {
+  id: string;
+  url: string;
+  revoke?: () => void;
+}
+
+/**
+ * Where to play `id` from: the on-device copy when there is one (so a
+ * downloaded track plays with no connection at all), else the stream —
+ * optionally asking the server to resolve that stream ahead of time.
+ */
+async function sourceFor(id: string, { warm = false } = {}): Promise<Loaded> {
+  const blob = await getOfflineBlob(id).catch(() => null);
+  if (blob) {
+    const url = URL.createObjectURL(blob);
+    return { id, url, revoke: () => URL.revokeObjectURL(url) };
+  }
+  if (warm) prefetchStream(id).catch(() => {});
+  return { id, url: streamUrl(id) };
+}
+
 /**
  * The music player's single `<audio>` + Plyr instance and everything that
  * follows the current track:
  *
  * - loads it (the offline copy when there is one, else the stream);
- * - autoplays it, and if the browser blocks that (a track change while the
- *   app is backgrounded) retries on the next tap or when the tab is visible;
+ * - prepares `upcoming` (its offline copy, or a server-side stream warm-up)
+ *   and, when a track ends, swaps it into the `<audio>` element right inside
+ *   the `ended` event — no React round-trip, no await — so the next song
+ *   starts with the screen off / app in the background, like a native
+ *   player. The browser (Android especially) won't start audio again once
+ *   the page has gone silent in the background, so the gap must be zero;
+ * - autoplays it, and if the browser blocks that anyway retries on the next
+ *   tap or when the tab is visible;
  * - on a hard reload, restores the queue's track at its saved position
  *   without autoplaying or re-logging the play;
  * - logs the play, scrobbles now-playing / the listen, keeps the lock screen
@@ -45,11 +78,14 @@ function shouldScrobble(t: number, duration: number): boolean {
  */
 export function useAudioEngine({
   current,
+  upcoming,
   next,
   prev,
   onEnded,
 }: {
   current: Track | undefined;
+  /** The track `next()` will move to, if any. */
+  upcoming: Track | undefined;
   next: () => void;
   prev: () => void;
   onEnded: () => void;
@@ -64,6 +100,39 @@ export function useAudioEngine({
   onEndedRef.current = onEnded;
   const currentRef = useRef(current);
   currentRef.current = current;
+  const upcomingRef = useRef(upcoming);
+  upcomingRef.current = upcoming;
+
+  // What the <audio> element holds right now (`revoke` frees a blob URL).
+  const loadedRef = useRef<Loaded | null>(null);
+  // The upcoming track's source, ready to swap in synchronously on "ended".
+  const preparedRef = useRef<Loaded | null>(null);
+  // Set when "ended" already loaded the next track, so the load effect for
+  // that track only does the bookkeeping instead of reloading it.
+  const handedOffRef = useRef<string | null>(null);
+
+  function setSource(audio: HTMLAudioElement, src: Loaded) {
+    const prevSrc = loadedRef.current;
+    audio.src = src.url;
+    loadedRef.current = src;
+    if (prevSrc && prevSrc.url !== src.url) prevSrc.revoke?.();
+  }
+
+  // Track finished: start the next one in this same task, while the page is
+  // still "playing audio" as far as the OS is concerned.
+  function handOffToUpcoming(audio: HTMLAudioElement): boolean {
+    const up = upcomingRef.current;
+    const prepared = preparedRef.current;
+    if (!up || !prepared || prepared.id !== up.id) return false;
+    preparedRef.current = null; // ownership moves to loadedRef
+    setSource(audio, prepared);
+    handedOffRef.current = up.id;
+    audio.play().catch(() => {
+      setMediaSessionState("paused");
+      scheduleAutoplayResume();
+    });
+    return true;
+  }
 
   const scrobbledRef = useRef(false);
   // True only for the first track when it came back from a persisted queue.
@@ -140,10 +209,19 @@ export function useAudioEngine({
       setMediaSessionState("playing");
     });
     player.on("pause", () => {
+      // "pause" fires right before "ended": if a next track is lined up,
+      // don't tell the OS we stopped — it may drop us in the background.
+      const a = audioRef.current;
+      const up = upcomingRef.current;
+      if (a?.ended && up && preparedRef.current?.id === up.id) return;
       setNowPlaying({ paused: true });
       setMediaSessionState("paused");
     });
-    player.on("ended", () => onEndedRef.current());
+    player.on("ended", () => {
+      const a = audioRef.current;
+      if (a) handOffToUpcoming(a);
+      onEndedRef.current();
+    });
 
     const off = onPlaybackClaim((kind) => {
       if (kind !== "music") audioRef.current?.pause();
@@ -153,6 +231,8 @@ export function useAudioEngine({
       resumeCleanupRef.current?.();
       player.destroy();
       closeAudioCtx();
+      loadedRef.current?.revoke?.();
+      preparedRef.current?.revoke?.();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -169,21 +249,31 @@ export function useAudioEngine({
     resumeCleanupRef.current?.();
     scrobbledRef.current = false;
 
+    const handedOff = handedOffRef.current === track.id && !restoring;
+    handedOffRef.current = null;
+    if (handedOff) {
+      // "ended" already swapped this track in and started it.
+      if (!audio.paused) setMediaSessionState("playing");
+      recordPlay(track, "song", "player");
+      if (scrobblingOn()) scrobbleNowPlaying(track);
+      bindMediaSession(
+        track,
+        () => audioRef.current,
+        () => actionsRef.current.next(),
+        () => actionsRef.current.prev(),
+      );
+      return;
+    }
+
     let cancelled = false;
-    let revokeSrc: (() => void) | null = null;
 
     (async () => {
-      // Prefer the on-device copy so a downloaded track plays with no
-      // connection at all.
-      const blob = await getOfflineBlob(track.id).catch(() => null);
-      if (cancelled) return;
-      if (blob) {
-        const url = URL.createObjectURL(blob);
-        revokeSrc = () => URL.revokeObjectURL(url);
-        audio.src = url;
-      } else {
-        audio.src = streamUrl(track.id);
+      const src = await sourceFor(track.id);
+      if (cancelled) {
+        src.revoke?.();
+        return;
       }
+      setSource(audio, src);
 
       if (restoring) {
         // Back from a hard reload: ready-to-play at the saved spot, but no
@@ -221,10 +311,35 @@ export function useAudioEngine({
 
     return () => {
       cancelled = true;
-      revokeSrc?.();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [current]);
+
+  // ---- Line up the next track so "ended" can start it instantly ----
+  useEffect(() => {
+    if (!upcoming) return;
+    const id = upcoming.id;
+    let mine: Loaded | null = null;
+    let cancelled = false;
+    (async () => {
+      const src = await sourceFor(id, { warm: true });
+      if (cancelled) {
+        src.revoke?.();
+        return;
+      }
+      mine = src;
+      preparedRef.current?.revoke?.();
+      preparedRef.current = src;
+    })();
+    return () => {
+      cancelled = true;
+      // Not consumed by a hand-off: free it.
+      if (mine && preparedRef.current === mine) {
+        preparedRef.current = null;
+        mine.revoke?.();
+      }
+    };
+  }, [upcoming?.id]);
 
   return {
     audioRef,

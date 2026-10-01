@@ -74,3 +74,20 @@ describe("useRadio", () => {
     expect(appendMany).not.toHaveBeenCalled();
   });
 });
+
+describe("useRadio look-ahead", () => {
+  beforeEach(() => vi.mocked(related).mockReset());
+
+  it("lines up more songs as soon as the last queued track starts", async () => {
+    vi.mocked(related).mockResolvedValue([t("x")]);
+    const appendMany = vi.fn();
+    const props = { radio: true, current: t("a"), hasNext: true, queue: [t("a"), t("b")], appendMany };
+    const { rerender } = renderHook((p) => useRadio(p), { initialProps: props });
+    expect(related).not.toHaveBeenCalled();
+
+    // Moved on to "b", the last one: fetch now, not when it ends.
+    rerender({ ...props, current: t("b"), hasNext: false });
+    await waitFor(() => expect(appendMany).toHaveBeenCalledWith([t("x")]));
+    expect(related).toHaveBeenCalledWith("b");
+  });
+});
